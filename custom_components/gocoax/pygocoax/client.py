@@ -54,6 +54,8 @@ LOCAL_INFO_LINK_STATUS_IDX = 5
 LOCAL_INFO_MOCA_VER_IDX = 11
 LOCAL_INFO_NODE_BITMASK_IDX = 12  # bitmask of active node IDs on network
 
+NODE_INFO_PHY_RATE_IDX = 3  # data[3] bits 0-15 = PHY rate in Mbps; upper byte = MoCA version
+
 FRAME_TX_GOOD_IDX = 12
 FRAME_TX_BAD_IDX = 30
 FRAME_TX_DROP_IDX = 48
@@ -357,11 +359,16 @@ class GoCoaxClient:
                     continue
                 moca_ver_int = self._parse_hex_value(data[4])
                 moca_ver = self._parse_moca_version(moca_ver_int)
+                # data[3] encodes: upper byte = MoCA version, lower 16 bits = PHY rate (Mbps)
+                rate_raw = self._parse_hex_value(data[NODE_INFO_PHY_RATE_IDX])
+                phy_rate = rate_raw & 0xFFFF  # MoCA links are symmetric: TX == RX
                 peers.append(
                     NetworkPeer(
                         node_id=node_id,
                         mac_address=mac_addr,
                         moca_version=moca_ver,
+                        tx_phy_rate=phy_rate,
+                        rx_phy_rate=phy_rate,
                     )
                 )
                 LOG.debug(
@@ -555,24 +562,34 @@ class GoCoaxClient:
 
         packets = await self.get_frame_info()
         peers = await self.get_node_info(local_node_id=node_id, node_bitmask=node_bitmask)
-        phy_rates = await self.get_phy_rates()
+
+        # Build PHY rate list from per-node API data (HTML scraping is unreliable on
+        # firmware 2.0.16.0 because phyRates.html renders its table via JavaScript).
+        phy_rates = [
+            PhyRate(
+                source_mac=mac_address,
+                target_mac=peer.mac_address,
+                tx_rate=peer.tx_phy_rate,
+                rx_rate=peer.rx_phy_rate,
+            )
+            for peer in peers
+            if peer.tx_phy_rate > 0
+        ]
 
         # fetch additional data for enhanced monitoring
         privacy_info = await self.get_privacy_info()
         config_info = await self.get_config_info()
-        fmr_info = await self.get_fmr_info()
         status_page = await self.get_status_page()
 
         # fill in source mac for phy rates
         for rate in phy_rates:
             rate.source_mac = mac_address
 
-        # build signal quality from FMR data
         signal_quality = SignalQuality(
-            snr=fmr_info.get("snr"),
-            tx_power=fmr_info.get("tx_power"),
-            rx_power=fmr_info.get("rx_power"),
-            bit_loading=fmr_info.get("bit_loading"),
+            snr=None,
+            tx_power=None,
+            rx_power=None,
+            bit_loading=None,
         )
 
         # determine channel count (prefer config, fallback to status page)
