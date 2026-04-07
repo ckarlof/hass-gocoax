@@ -8,6 +8,7 @@ import re
 from typing import TYPE_CHECKING
 
 import aiohttp
+import yarl
 from aiohttp import BasicAuth
 
 from .exceptions import (
@@ -140,23 +141,53 @@ class GoCoaxClient:
                         "content-type": "application/x-www-form-urlencoded",
                         "Accept": "text/html, */*",
                     }
-                    if self._csrf_token:
-                        headers["X-CSRF-TOKEN"] = self._csrf_token
+
+                    # Prefer the token currently in the session jar — intermediate
+                    # GET responses may have rotated it since our last fetch.
+                    host_url = yarl.URL(f"http://{self._host}/")
+                    jar_token = session.cookie_jar.filter_cookies(host_url).get(
+                        "csrf_token"
+                    )
+                    effective_token: str = (
+                        jar_token.value if jar_token else (self._csrf_token or "")
+                    )
+
+                    # The firmware uses the Double Submit Cookie pattern:
+                    # it validates that the X-CSRF-TOKEN header matches the
+                    # csrf_token cookie.  Explicitly send the cookie so that
+                    # this works even when the session jar is not replaying it
+                    # (e.g. HA's shared session with IP-address cookie restrictions).
+                    request_cookies: dict[str, str] = {}
+                    if effective_token:
+                        headers["X-CSRF-TOKEN"] = effective_token
+                        request_cookies["csrf_token"] = effective_token
 
                     body = f'{{"data":[{post_data}]}}'
                     async with session.post(
-                        url, data=body, auth=auth, headers=headers
+                        url, data=body, auth=auth, headers=headers,
+                        cookies=request_cookies,
                     ) as resp:
                         # 400 may mean CSRF token expired — refresh and retry once
-                        if resp.status == 400 and self._csrf_token:
+                        if resp.status == 400 and effective_token:
                             self._csrf_token = None
                             await self._fetch_csrf_token()
-                            # Rebuild header with fresh token (or drop it if absent)
+                            jar_token = session.cookie_jar.filter_cookies(
+                                host_url
+                            ).get("csrf_token")
+                            effective_token = (
+                                jar_token.value
+                                if jar_token
+                                else (self._csrf_token or "")
+                            )
+                            # Rebuild header and cookie with fresh token
                             headers.pop("X-CSRF-TOKEN", None)
-                            if self._csrf_token:
-                                headers["X-CSRF-TOKEN"] = self._csrf_token
+                            request_cookies.clear()
+                            if effective_token:
+                                headers["X-CSRF-TOKEN"] = effective_token
+                                request_cookies["csrf_token"] = effective_token
                             async with session.post(
-                                url, data=body, auth=auth, headers=headers
+                                url, data=body, auth=auth, headers=headers,
+                                cookies=request_cookies,
                             ) as resp2:
                                 return await self._handle_response(resp2, url)
                         return await self._handle_response(resp, url)
