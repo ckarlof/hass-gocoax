@@ -284,6 +284,7 @@ class GoCoaxClient:
         resp = await self._request(ENDPOINT_LOCAL_INFO, method="POST")
         if isinstance(resp, dict) and "data" in resp:
             data = resp["data"]
+            LOG.debug("Local info response (raw): %s", data)
             return {
                 "link_status": self._parse_hex_value(data[LOCAL_INFO_LINK_STATUS_IDX])
                 if len(data) > LOCAL_INFO_LINK_STATUS_IDX
@@ -514,26 +515,27 @@ class GoCoaxClient:
         try:
             html = await self._request(ENDPOINT_STATUS_HTML)
             if isinstance(html, str):
-                # look for common status values in HTML
-                # firmware version
+                LOG.debug("Status page HTML (first 2000 chars): %s", html[:2000])
+
+                # firmware version — plain text or JS variable
                 fw_match = re.search(
-                    r"firmware[:\s]+([0-9.]+)",
+                    r"(?:firmware[_\s]*(?:version)?[:\s\"'=]+|[\"'](?:fw|firmware)[_]?(?:ver|version)?[\"']\s*[:=]\s*[\"'])([0-9][0-9.]+)",
                     html,
                     re.IGNORECASE,
                 )
                 if fw_match:
                     result["firmware_version"] = fw_match.group(1)
 
-                # model name
+                # model name — plain text or JS variable
                 model_match = re.search(
-                    r"model[:\s]+(MA\d+\w*|WF-\d+\w*|FCA\d+)",
+                    r"(?:model[:\s\"'=]+|[\"']model[\"']\s*[:=]\s*[\"'])(MA\d+\w*|WF-\d+\w*|FCA\d+)",
                     html,
                     re.IGNORECASE,
                 )
                 if model_match:
                     result["model"] = model_match.group(1).upper()
 
-                # channel count (sometimes shown)
+                # channel count
                 channel_match = re.search(
                     r"(\d+)\s*channels?",
                     html,
