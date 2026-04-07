@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# pytest
+.pytest_cache/
+.coverage
+
+# Home Assistant
+*.log
