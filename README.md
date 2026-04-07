@@ -15,13 +15,15 @@ Sensors for monitoring [goCoax](https://gocoax.com/) MoCA adapters and the assoc
 
 | Manufacturer | Model   | MoCA Speed | Ethernet Port | Supported | Known Working Firmware |
 |--------------|---------|:----------:|:-------------:|:---------:|:-------------:|
-| goCoax       | MA2500D | 2.5        | 2.5 GbE       | YES       | 2.0.11 |
+| goCoax       | MA2500D | 2.5        | 2.5 GbE       | YES       | 2.0.11, 2.0.16.0 |
 | goCoax       | MA2500C | 2.5        | 2.5 GbE       | YES       | 3.0.5 |
 | goCoax       | WF-803M | 2.5        | 1.0 GbE       | YES       | 1.0.12 |
 | Frontier     | FCA252  | 2.5        | 1.0 GbE       | YES       | |
 | Frontier     | WF-803T / FCA251 | 2.5 | 1.0 GbE    | YES       | |
 
 **NOTE: To ensure sensor data is properly read from the adapters, it is recommended that you update to the LATEST FIRMWARE offered by [goCoax Support](https://www.gocoax.com/support), or one of the firmwares listed in the above table. However, upgrading firmware MAY reset settings on the adapter.**
+
+**Firmware 2.0.16.0 compatibility note:** Firmware 2.0.16.0 introduced breaking API changes including CSRF token protection and a redesigned node discovery mechanism. This integration handles both old and new firmware automatically — no configuration changes are required when upgrading.
 
 ## Installation
 

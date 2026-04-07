@@ -13,6 +13,7 @@ from aiohttp import BasicAuth
 from .exceptions import (
     GoCoaxAuthError,
     GoCoaxConnectionError,
+    GoCoaxError,
     GoCoaxParseError,
     GoCoaxTimeoutError,
 )
@@ -33,13 +34,12 @@ LOG = logging.getLogger(__name__)
 # API endpoints - JSON data
 ENDPOINT_MAC = "/ms/1/0x103/GET"
 ENDPOINT_LOCAL_INFO = "/ms/0/0x15"
-ENDPOINT_STATUS = "/ms/0/0x16"
 ENDPOINT_FRAME_INFO = "/ms/0/0x14"
 ENDPOINT_FMR_INFO = "/ms/0/0x1D"
-ENDPOINT_NODE_INFO = "/ms/0/0x19"
-ENDPOINT_PRIVACY = "/ms/0/0x17"  # MoCA privacy/encryption settings
+ENDPOINT_NODE_INFO = "/ms/0/0x16"  # POST with node ID; firmware 2.0.16+ per-node query
+ENDPOINT_PRIVACY = "/ms/0/0x1059/GET"  # firmware 2.0.16+ security mode mask (GET)
 ENDPOINT_MPS = "/ms/0/0x18"  # MoCA Protected Setup
-ENDPOINT_CONFIG = "/ms/0/0x1A"  # configuration parameters
+ENDPOINT_CONFIG = "/ms/0/0x1003/GET"  # firmware 2.0.16+ LOF endpoint (GET)
 
 # HTML page endpoints
 ENDPOINT_PHY_RATES = "/phyRates.html"
@@ -47,10 +47,11 @@ ENDPOINT_SECURITY_HTML = "/security.html"
 ENDPOINT_STATUS_HTML = "/index.html"
 
 # data indices from decoded format
-LOCAL_INFO_LINK_STATUS_IDX = 5
-LOCAL_INFO_MOCA_VER_IDX = 11
 LOCAL_INFO_NODE_ID_IDX = 3
 LOCAL_INFO_NC_NODE_IDX = 4
+LOCAL_INFO_LINK_STATUS_IDX = 5
+LOCAL_INFO_MOCA_VER_IDX = 11
+LOCAL_INFO_NODE_BITMASK_IDX = 12  # bitmask of active node IDs on network
 
 FRAME_TX_GOOD_IDX = 12
 FRAME_TX_BAD_IDX = 30
@@ -81,6 +82,7 @@ class GoCoaxClient:
         self._owns_session = session is None
         self._timeout = timeout
         self._base_url = f"http://{host}"
+        self._csrf_token: str | None = None  # None = not yet fetched
 
     async def _get_session(self) -> ClientSession:
         """Get or create aiohttp session."""
@@ -95,20 +97,68 @@ class GoCoaxClient:
             await self._session.close()
             self._session = None
 
-    async def _request(self, endpoint: str, method: str = "GET") -> dict | str:
+    async def _fetch_csrf_token(self) -> None:
+        """Fetch CSRF token from the device main page.
+
+        Firmware 2.0.16.0+ requires an X-CSRF-TOKEN header on all POST
+        requests. The token is set as a cookie on the first page load.
+        """
+        try:
+            session = await self._get_session()
+            url = f"{self._base_url}/index.html"
+            auth = BasicAuth(self._username, self._password)
+            async with session.get(url, auth=auth) as resp:
+                if resp.status == 200:
+                    token = resp.cookies.get("csrf_token")
+                    if token:
+                        self._csrf_token = token.value
+                        LOG.debug("Obtained CSRF token from %s", self._host)
+                        return
+        except Exception as err:
+            LOG.debug("Could not fetch CSRF token from %s: %s", self._host, err)
+        # Older firmware has no CSRF protection — mark as fetched but absent
+        self._csrf_token = ""
+
+    async def _request(
+        self, endpoint: str, method: str = "GET", post_data: str = ""
+    ) -> dict | str:
         """Make an authenticated request to the adapter."""
         session = await self._get_session()
         url = f"{self._base_url}{endpoint}"
         auth = BasicAuth(self._username, self._password)
 
         try:
+            if method == "POST":
+                # CSRF fetch gets its own implicit timeout (aiohttp connector),
+                # separate from the per-request timeout below.
+                if self._csrf_token is None:
+                    await self._fetch_csrf_token()
+
             async with asyncio.timeout(self._timeout):
                 if method == "POST":
-                    # goCoax uses funky POST with form data
-                    headers = {"content-type": "application/x-www-form-urlencoded"}
+                    headers: dict[str, str] = {
+                        "content-type": "application/x-www-form-urlencoded",
+                        "Accept": "text/html, */*",
+                    }
+                    if self._csrf_token:
+                        headers["X-CSRF-TOKEN"] = self._csrf_token
+
+                    body = f'{{"data":[{post_data}]}}'
                     async with session.post(
-                        url, data='{"data":[2]}', auth=auth, headers=headers
+                        url, data=body, auth=auth, headers=headers
                     ) as resp:
+                        # 400 may mean CSRF token expired — refresh and retry once
+                        if resp.status == 400 and self._csrf_token:
+                            self._csrf_token = None
+                            await self._fetch_csrf_token()
+                            # Rebuild header with fresh token (or drop it if absent)
+                            headers.pop("X-CSRF-TOKEN", None)
+                            if self._csrf_token:
+                                headers["X-CSRF-TOKEN"] = self._csrf_token
+                            async with session.post(
+                                url, data=body, auth=auth, headers=headers
+                            ) as resp2:
+                                return await self._handle_response(resp2, url)
                         return await self._handle_response(resp, url)
                 else:
                     async with session.get(url, auth=auth) as resp:
@@ -196,7 +246,9 @@ class GoCoaxClient:
 
     async def get_local_info(self) -> dict:
         """Get local adapter info (link status, MoCA version, etc.)."""
-        resp = await self._request(ENDPOINT_LOCAL_INFO)
+        # Empty data body {"data":[]} is correct for this endpoint — verified
+        # against firmware 2.0.16.0 device (devStatus.html form value="").
+        resp = await self._request(ENDPOINT_LOCAL_INFO, method="POST")
         if isinstance(resp, dict) and "data" in resp:
             data = resp["data"]
             return {
@@ -212,13 +264,16 @@ class GoCoaxClient:
                 "nc_node_id": self._parse_hex_value(data[LOCAL_INFO_NC_NODE_IDX])
                 if len(data) > LOCAL_INFO_NC_NODE_IDX
                 else 0,
+                "node_bitmask": self._parse_hex_value(data[LOCAL_INFO_NODE_BITMASK_IDX])
+                if len(data) > LOCAL_INFO_NODE_BITMASK_IDX
+                else 0,
                 "raw_data": data,
             }
         raise GoCoaxParseError("Invalid local info response")
 
     async def get_frame_info(self) -> EthernetPackets:
         """Get ethernet tx/rx packet statistics."""
-        resp = await self._request(ENDPOINT_FRAME_INFO)
+        resp = await self._request(ENDPOINT_FRAME_INFO, method="POST", post_data="0")
         if isinstance(resp, dict) and "data" in resp:
             data = resp["data"]
             tx_good = self._parse_64bit_value(data, FRAME_TX_GOOD_IDX)
@@ -234,59 +289,57 @@ class GoCoaxClient:
             )
         raise GoCoaxParseError("Invalid frame info response")
 
-    async def get_node_info(self, local_node_id: int = -1) -> list[NetworkPeer]:
-        """Get information about other nodes on the MoCA network.
+    async def get_node_info(
+        self, local_node_id: int = -1, node_bitmask: int = 0
+    ) -> list[NetworkPeer]:
+        """Get information about peer nodes on the MoCA network.
 
-        The node info endpoint returns data for all nodes. Each node entry
-        contains: node_id, mac_address (2 hex values), moca_version, etc.
-        Format varies by firmware but typically uses 16 values per node.
+        Firmware 2.0.16+ removed the all-nodes endpoint. Instead, the local
+        info response includes a node_bitmask indicating which node IDs are
+        active; each active node is then queried individually via the net info
+        endpoint with its node ID in the request body.
+
+        Response layout per node: data[0]=mac_hi, data[1]=mac_lo, data[4]=moca_ver
         """
         peers: list[NetworkPeer] = []
+        if node_bitmask == 0:
+            return peers
         try:
-            resp = await self._request(ENDPOINT_NODE_INFO)
-            if isinstance(resp, dict) and "data" in resp:
+            for node_id in range(16):
+                if not (node_bitmask & (1 << node_id)):
+                    continue
+                if node_id == local_node_id:
+                    continue
+                resp = await self._request(
+                    ENDPOINT_NODE_INFO, method="POST", post_data=str(node_id)
+                )
+                if not (isinstance(resp, dict) and "data" in resp):
+                    continue
                 data = resp["data"]
-                LOG.debug("Node info response (raw): %s", data)
-
-                # typical format: 16 values per node
-                # [0]=node_id, [1]=mac_hi, [2]=mac_lo, [3]=moca_ver, ...
-                node_size = 16
-                if len(data) >= node_size:
-                    num_nodes = len(data) // node_size
-                    for i in range(num_nodes):
-                        offset = i * node_size
-                        node_id = self._parse_hex_value(data[offset])
-
-                        # skip local node and empty entries
-                        if node_id == local_node_id or node_id == 0:
-                            continue
-
-                        mac_hi = self._parse_hex_value(data[offset + 1])
-                        mac_lo = self._parse_hex_value(data[offset + 2])
-                        mac_addr = self._hex_to_mac(mac_hi, mac_lo)
-
-                        # skip if MAC is all zeros (empty slot)
-                        if mac_addr == "00:00:00:00:00:00":
-                            continue
-
-                        moca_ver_int = self._parse_hex_value(data[offset + 3])
-                        moca_ver = self._parse_moca_version(moca_ver_int)
-
-                        peers.append(
-                            NetworkPeer(
-                                node_id=node_id,
-                                mac_address=mac_addr,
-                                moca_version=moca_ver,
-                            )
-                        )
-                        LOG.debug(
-                            "Parsed peer: node_id=%d, mac=%s, version=%s",
-                            node_id,
-                            mac_addr,
-                            moca_ver,
-                        )
-
-        except (GoCoaxConnectionError, GoCoaxParseError) as err:
+                LOG.debug("Node info for node %d (raw): %s", node_id, data)
+                if len(data) < 5:
+                    continue
+                mac_hi = self._parse_hex_value(data[0])
+                mac_lo = self._parse_hex_value(data[1])
+                mac_addr = self._hex_to_mac(mac_hi, mac_lo)
+                if mac_addr == "00:00:00:00:00:00":
+                    continue
+                moca_ver_int = self._parse_hex_value(data[4])
+                moca_ver = self._parse_moca_version(moca_ver_int)
+                peers.append(
+                    NetworkPeer(
+                        node_id=node_id,
+                        mac_address=mac_addr,
+                        moca_version=moca_ver,
+                    )
+                )
+                LOG.debug(
+                    "Parsed peer: node_id=%d, mac=%s, version=%s",
+                    node_id,
+                    mac_addr,
+                    moca_ver,
+                )
+        except GoCoaxError as err:
             LOG.debug("Failed to get node info: %s", err)
         return peers
 
@@ -340,7 +393,8 @@ class GoCoaxClient:
     async def get_privacy_info(self) -> dict:
         """Get MoCA privacy/encryption settings.
 
-        Returns dict with encryption_enabled and potentially password hash.
+        Returns dict with encryption_enabled.
+        Endpoint /ms/0/0x1059/GET returns security mode mask; non-zero = enabled.
         """
         result: dict = {"encryption_enabled": None}
         try:
@@ -348,10 +402,9 @@ class GoCoaxClient:
             if isinstance(resp, dict) and "data" in resp:
                 data = resp["data"]
                 LOG.debug("Privacy info response (raw): %s", data)
-                # typical format: [0]=privacy_enabled (0=off, 1=on)
                 if len(data) >= 1:
                     privacy_val = self._parse_hex_value(data[0])
-                    result["encryption_enabled"] = privacy_val == 1
+                    result["encryption_enabled"] = privacy_val != 0
         except (GoCoaxConnectionError, GoCoaxParseError) as err:
             LOG.debug("Failed to get privacy info: %s", err)
         return result
@@ -368,7 +421,7 @@ class GoCoaxClient:
             "bit_loading": None,
         }
         try:
-            resp = await self._request(ENDPOINT_FMR_INFO)
+            resp = await self._request(ENDPOINT_FMR_INFO, method="POST", post_data="")
             if isinstance(resp, dict) and "data" in resp:
                 data = resp["data"]
                 LOG.debug("FMR info response (raw): %s", data)
@@ -382,7 +435,8 @@ class GoCoaxClient:
     async def get_config_info(self) -> dict:
         """Get configuration parameters including frequency band.
 
-        Returns LOF (lowest operating frequency), band settings, etc.
+        Returns LOF (lowest operating frequency) in MHz and band name.
+        Endpoint /ms/0/0x1003/GET returns current LOF value.
         """
         result: dict = {
             "frequency_band": None,
@@ -394,8 +448,6 @@ class GoCoaxClient:
             if isinstance(resp, dict) and "data" in resp:
                 data = resp["data"]
                 LOG.debug("Config info response (raw): %s", data)
-                # attempt to parse LOF and band configuration
-                # LOF is typically in MHz (e.g., 1125, 1400)
                 if len(data) >= 1:
                     lof = self._parse_hex_value(data[0])
                     if 1000 <= lof <= 1700:  # sanity check for MHz range
@@ -467,10 +519,11 @@ class GoCoaxClient:
         moca_version = self._parse_moca_version(moca_ver_int)
         node_id = local_info.get("node_id", 0)
         nc_node_id = local_info.get("nc_node_id", 0)
+        node_bitmask = local_info.get("node_bitmask", 0)
         is_nc = node_id == nc_node_id
 
         packets = await self.get_frame_info()
-        peers = await self.get_node_info(local_node_id=node_id)
+        peers = await self.get_node_info(local_node_id=node_id, node_bitmask=node_bitmask)
         phy_rates = await self.get_phy_rates()
 
         # fetch additional data for enhanced monitoring
