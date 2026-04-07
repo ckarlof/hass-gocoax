@@ -58,8 +58,12 @@ Add via the Home Assistant UI: **Settings > Devices & Services > Add Integration
 | IP Address | Adapter's IP address |
 | Node ID | MoCA network node identifier |
 | Network Peers | Count of other adapters on the MoCA network |
-| TX Packets | Ethernet transmit packet count (with ok/bad/dropped attributes) |
-| RX Packets | Ethernet receive packet count (with ok/bad/dropped attributes) |
+| TX Packets | Ethernet transmit packet count (successful) |
+| TX Bad Packets | Ethernet transmit error packet count |
+| TX Dropped Packets | Ethernet transmit dropped packet count |
+| RX Packets | Ethernet receive packet count (successful) |
+| RX Bad Packets | Ethernet receive error packet count |
+| RX Dropped Packets | Ethernet receive dropped packet count |
 | PHY TX Rate | Physical layer transmit rate to each peer (Mbps) |
 | PHY RX Rate | Physical layer receive rate from each peer (Mbps) |
 | Frequency Band | Operating frequency band (D-Low, D-High, Extended-D) |

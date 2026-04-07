@@ -65,8 +65,20 @@
       "tx_packets": {
         "name": "TX Packets"
       },
+      "tx_bad_packets": {
+        "name": "TX Bad Packets"
+      },
+      "tx_dropped_packets": {
+        "name": "TX Dropped Packets"
+      },
       "rx_packets": {
         "name": "RX Packets"
+      },
+      "rx_bad_packets": {
+        "name": "RX Bad Packets"
+      },
+      "rx_dropped_packets": {
+        "name": "RX Dropped Packets"
       },
       "peer_count": {
         "name": "Network Peers"
