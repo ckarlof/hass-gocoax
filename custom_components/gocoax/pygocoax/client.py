@@ -56,6 +56,13 @@ LOCAL_INFO_NODE_BITMASK_IDX = 12  # bitmask of active node IDs on network
 
 NODE_INFO_PHY_RATE_IDX = 3  # data[3] bits 0-15 = PHY rate in Mbps; upper byte = MoCA version
 
+LOCAL_INFO_FW_VERSION_IDX = 21  # ASCII bytes of SDK/firmware version start here
+
+ENDPOINT_PHY_INFO = "/ms/0/0x7f"   # MxL371x only: data[2]=first channel, data[3]=num channels
+ENDPOINT_CHIP_ID = "/ms/1/0x303/GET"  # chip ID: 0x15=MXL370x, 0x16=MXL371x
+
+_CHIP_NAMES = {0x15: "MXL370x", 0x16: "MXL371x"}
+
 FRAME_TX_GOOD_IDX = 12
 FRAME_TX_BAD_IDX = 30
 FRAME_TX_DROP_IDX = 48
@@ -250,6 +257,21 @@ class GoCoaxClient:
         b6 = (lo >> 16) & 0xFF
         return f"{b1:02x}:{b2:02x}:{b3:02x}:{b4:02x}:{b5:02x}:{b6:02x}"
 
+    def _hex_to_ascii_str(self, data: list[str], start_idx: int) -> str:
+        """Decode a null-terminated ASCII string packed into 32-bit hex words."""
+        result = []
+        for i in range(start_idx, len(data)):
+            word = self._parse_hex_value(data[i])
+            for shift in (24, 16, 8, 0):
+                byte = (word >> shift) & 0xFF
+                if byte == 0:
+                    return "".join(result)
+                if 0x20 <= byte < 0x80:
+                    result.append(chr(byte))
+                else:
+                    return "".join(result)
+        return "".join(result)
+
     def _parse_moca_version(self, ver_int: int) -> str:
         """Parse MoCA version from integer value."""
         # version is encoded as major * 16 + minor
@@ -285,6 +307,11 @@ class GoCoaxClient:
         if isinstance(resp, dict) and "data" in resp:
             data = resp["data"]
             LOG.debug("Local info response (raw): %s", data)
+            fw_version = (
+                self._hex_to_ascii_str(data, LOCAL_INFO_FW_VERSION_IDX)
+                if len(data) > LOCAL_INFO_FW_VERSION_IDX
+                else None
+            )
             return {
                 "link_status": self._parse_hex_value(data[LOCAL_INFO_LINK_STATUS_IDX])
                 if len(data) > LOCAL_INFO_LINK_STATUS_IDX
@@ -301,6 +328,7 @@ class GoCoaxClient:
                 "node_bitmask": self._parse_hex_value(data[LOCAL_INFO_NODE_BITMASK_IDX])
                 if len(data) > LOCAL_INFO_NODE_BITMASK_IDX
                 else 0,
+                "firmware_version": fw_version or None,
                 "raw_data": data,
             }
         raise GoCoaxParseError("Invalid local info response")
@@ -428,6 +456,43 @@ class GoCoaxClient:
                     except ValueError:
                         continue
         return rates
+
+    async def get_phy_info(self) -> dict:
+        """Get PHY info including channel count (MXL371x only).
+
+        /ms/0/0x7f: data[2]=first channel (MHz), data[3]=number of bonded channels.
+        """
+        result: dict = {"channel_count": None, "first_channel": None}
+        try:
+            resp = await self._request(ENDPOINT_PHY_INFO, method="POST")
+            if isinstance(resp, dict) and "data" in resp:
+                data = resp["data"]
+                LOG.debug("PHY info response (raw): %s", data)
+                if len(data) >= 4:
+                    first_ch = self._parse_hex_value(data[2])
+                    num_ch = self._parse_hex_value(data[3])
+                    if num_ch > 0:
+                        result["channel_count"] = num_ch
+                    if first_ch > 0:
+                        result["first_channel"] = first_ch
+        except (GoCoaxConnectionError, GoCoaxParseError) as err:
+            LOG.debug("Failed to get PHY info: %s", err)
+        return result
+
+    async def get_chip_id(self) -> str | None:
+        """Get chip name from chip ID register.
+
+        /ms/1/0x303/GET: returns chip ID; 0x15=MXL370x, 0x16=MXL371x.
+        """
+        try:
+            resp = await self._request(ENDPOINT_CHIP_ID)
+            if isinstance(resp, dict) and "data" in resp:
+                data = resp["data"]
+                chip_id = self._parse_hex_value(data[0])
+                return _CHIP_NAMES.get(chip_id, f"Unknown(0x{chip_id:02x})")
+        except (GoCoaxConnectionError, GoCoaxParseError) as err:
+            LOG.debug("Failed to get chip ID: %s", err)
+        return None
 
     async def get_privacy_info(self) -> dict:
         """Get MoCA privacy/encryption settings.
@@ -581,6 +646,8 @@ class GoCoaxClient:
         # fetch additional data for enhanced monitoring
         privacy_info = await self.get_privacy_info()
         config_info = await self.get_config_info()
+        phy_info = await self.get_phy_info()
+        chip_name = await self.get_chip_id()
         status_page = await self.get_status_page()
 
         # fill in source mac for phy rates
@@ -594,10 +661,21 @@ class GoCoaxClient:
             bit_loading=None,
         )
 
-        # determine channel count (prefer config, fallback to status page)
-        channel_count = config_info.get("channel_count") or status_page.get(
-            "channel_count"
+        # channel count: prefer dedicated PHY info endpoint, fall back to status page
+        channel_count = (
+            phy_info.get("channel_count")
+            or config_info.get("channel_count")
+            or status_page.get("channel_count")
         )
+
+        # firmware version: prefer local info ASCII field, fall back to status page
+        firmware_version = (
+            local_info.get("firmware_version")
+            or status_page.get("firmware_version")
+        )
+
+        # model: chip name from chip ID register, fall back to status page
+        model = chip_name or status_page.get("model")
 
         return AdapterStatus(
             mac_address=mac_address,
@@ -610,8 +688,8 @@ class GoCoaxClient:
             node_id=node_id,
             nc_node_id=nc_node_id,
             network_controller=is_nc,
-            firmware_version=status_page.get("firmware_version"),
-            model=status_page.get("model"),
+            firmware_version=firmware_version,
+            model=model,
             frequency_band=config_info.get("frequency_band"),
             lof=config_info.get("lof"),
             encryption_enabled=privacy_info.get("encryption_enabled"),
